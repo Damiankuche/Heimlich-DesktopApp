@@ -93,6 +93,7 @@ class CameraApp(QMainWindow):
             # si no existe el botón en la UI, no hacer nada (puede llamarse start_session manualmente)
             pass
 
+
         self.ui.show()
 
     def log_session_error(self, message: str):
@@ -146,9 +147,13 @@ class CameraApp(QMainWindow):
                 qdialog.setModal(True)
 
             # Rellenar contenido dinámico si existen los widgets
-            lbl_nota = qdialog.findChild(QLabel, "lblNota")
+            lbl_nota = qdialog.findChild(QLabel, "lblRes")
 
-            lbl_nota.setText(f"{proba:.2f}")
+            if proba > 5:
+                lbl_nota.setPixmap(self.correcto_icon)
+            else:
+                lbl_nota.setPixmap(self.error_icon)
+
 
             # Conexión de botones si existen
             btn_cerrar = qdialog.findChild(QPushButton, "btnCerrar")
@@ -241,6 +246,7 @@ class CameraApp(QMainWindow):
 
     def start_session(self):
         """Iniciar una sesión de 11 segundos: guardar fotos cada 3s y evaluar."""
+        self.label.clear()
         if self.session_active:
             print("Ya hay una sesión en curso.")
             return
@@ -260,7 +266,8 @@ class CameraApp(QMainWindow):
         if not self.timer.isActive():
             self.timer.start(30)
         if not self.capture_timer.isActive():
-            self.capture_timer.start(30)
+            # TODO
+            self.capture_timer.start(1500)
 
         # Hacer una captura inmediata al iniciar la sesión (t=0)
         try:
@@ -347,7 +354,6 @@ class CameraApp(QMainWindow):
         b64_str = base64.b64encode(buf.tobytes()).decode("utf-8")
 
         result = self.post_request(b64_str)
-
         # Manejar errores del post_request
         if isinstance(result, dict) and "error" in result:
             # Registrar error para revisar luego (no mostrar al usuario)
@@ -394,6 +400,7 @@ class CameraApp(QMainWindow):
         h, w, ch = frame_rgb.shape
         qimg = QImage(frame_rgb.data, w, h, ch*w, QImage.Format_RGB888)
         self.label.setPixmap(QPixmap.fromImage(qimg))
+
 
     def closeEvent(self, event):
         """Cerrar cámara al cerrar la app"""
