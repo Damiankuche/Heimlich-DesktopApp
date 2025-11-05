@@ -13,8 +13,21 @@ from PySide6.QtCore import QFile, QIODevice
 from pathlib import Path
 from PySide6.QtCore import Qt
 import time
+
 from PySide6.QtWidgets import QApplication, QLabel, QMainWindow, QDialog, QPushButton
 import os
+os.environ["TF_CPP_MIN_LOG_LEVEL"] = "2"  # 1=oculta INFO, 2=oculta también WARNING, 3=oculta ERROR
+
+# silenciar logs de absl (los que imprime MediaPipe)
+from absl import logging as absl_logging
+absl_logging.set_verbosity(absl_logging.ERROR)
+
+# (opcional) por si tu runtime usa el logger estándar
+import logging
+logging.getLogger("absl").setLevel(logging.ERROR)
+
+import mediapipe as mp  # <-- después de silenciar
+
 
 
 def load_ui(path):
@@ -54,6 +67,37 @@ class CameraApp(QMainWindow):
 
         # Inicializar la cámara (0 = webcam principal)
         self.cap = cv2.VideoCapture(0)
+
+        # --- MediaPipe Holistic (una sola instancia, estable) ---
+        self.mp_holistic = mp.solutions.holistic
+        self.mp_pose = mp.solutions.pose
+        self.mp_hands = mp.solutions.hands
+        self.mp_draw = mp.solutions.drawing_utils
+
+        self.holistic = self.mp_holistic.Holistic(
+            static_image_mode=False,  # tracking entre frames
+            model_complexity=1,  # 0=rápido, 1=mejor; probá 0 si tu CPU sufre
+            smooth_landmarks=True,  # suaviza y reduce jitter
+            enable_segmentation=False,
+            refine_face_landmarks=False,  # sin cara
+            min_detection_confidence=0.6,  # subí si hay ruido
+            min_tracking_confidence=0.6
+        )
+
+        # Procesar 1 de cada N frames (si tu CPU lo necesita)
+        self.frame_count = 0
+        self.process_every = 2
+
+        # Estado para evitar parpadeo: último resultado válido y “edad”
+        self.last_valid_res = None
+        self.last_valid_age = 0
+        self.hold_max_frames = 6  # cuánto tiempo "sostener" el overlay si se pierde detección
+
+
+
+        # para no saturar CPU: procesar 1 de cada N frames
+        self.frame_count = 0
+        self.process_every = 2  # probá 2 ó 3 si tu CPU sufre
 
         # guardar último frame
         self.last_frame_bgr = None
@@ -199,10 +243,36 @@ class CameraApp(QMainWindow):
         print("Cámara reiniciada.")
 
     def post_request(self, image: str):
-        """Envía la imagen al servidor y devuelve un dict consistente.
+        payload = {"image": image}  # ✅ clave correcta
+        print("Enviando request al servidor.")
+        try:
+            r = requests.post("http://127.0.0.1:8000/predictOne", json=payload, timeout=120)
+        except requests.RequestException as e:
+            print(f"[POST] Error de red: {e}")
+            return {"error": str(e)}
+
+        try:
+            data = r.json()
+        except ValueError:
+            return {"error": "Respuesta no es JSON", "raw": r.text}
+
+        if not r.ok:
+            # 👇 deja este print para ver el detalle de FastAPI
+            print("[POST] HTTP error:", r.status_code, data)
+            return {"error": "HTTP error", "status": r.status_code, "detail": data.get("detail", data)}
+
+        label = data.get("label")
+        if label is None:
+            return {"error": "Campo 'label' ausente", "data": data}
+
+        print("Resultado de prediccion:", label)
+        return {"prediction": label, "raw": data}
+
+    """def post_request(self, image: str):
+        ""Envía la imagen al servidor y devuelve un dict consistente.
         En caso de éxito: {"prediction": <str>, "raw": <response-json>}.
         En caso de error: {"error": <mensaje>, ...}.
-        """
+        ""
         payload = {"image": image}  # se pasa una imagen al request
         print("Enviando request al servidor.")
         try:
@@ -231,7 +301,7 @@ class CameraApp(QMainWindow):
             return {"error": "Campo 'prediction' ausente", "data": data}
 
         print("Resultado de prediccion:", prediction)
-        return {"prediction": prediction, "raw": data}
+        return {"prediction": prediction, "raw": data}"""
 
 
     def set_icon_result(self, result: str):
@@ -276,7 +346,7 @@ class CameraApp(QMainWindow):
             print(f"Error al capturar inmediatamente: {e}")
 
         # Iniciar timer de 12 segundos
-        self.session_timer.start(12000)
+        self.session_timer.start(100000)
         print(f"Sesión iniciada. Guardando en: {self.session_dir}")
 
     def end_session(self):
@@ -389,7 +459,7 @@ class CameraApp(QMainWindow):
         self.set_icon_result(prediction)
 
 
-    def update_frame(self):
+    """def update_frame(self):
         ok, frame_bgr = self.cap.read()
         if not ok:
             return
@@ -399,8 +469,104 @@ class CameraApp(QMainWindow):
         frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
         h, w, ch = frame_rgb.shape
         qimg = QImage(frame_rgb.data, w, h, ch*w, QImage.Format_RGB888)
-        self.label.setPixmap(QPixmap.fromImage(qimg))
+        self.label.setPixmap(QPixmap.fromImage(qimg))"""
 
+    def update_frame(self):
+        ok, frame_bgr = self.cap.read()
+        if not ok:
+            return
+
+        # Guardamos el frame limpio para enviar al backend
+        self.last_frame_bgr = frame_bgr
+
+        self.frame_count += 1
+        do_process = (self.frame_count % self.process_every == 0)
+
+        draw_on = frame_bgr.copy()
+
+        # Procesá en baja resolución para ganar FPS (mismo aspect ratio)
+        # y dibujá SIEMPRE sobre el tamaño original para que no pierda nitidez.
+        if do_process:
+            h0, w0 = frame_bgr.shape[:2]
+            small = cv2.resize(frame_bgr, (w0 // 2, h0 // 2))
+            small_rgb = cv2.cvtColor(small, cv2.COLOR_BGR2RGB)
+            res = self.holistic.process(small_rgb)
+
+            has_any = (res.pose_landmarks is not None) or \
+                      (res.left_hand_landmarks is not None) or \
+                      (res.right_hand_landmarks is not None)
+
+            if has_any:
+                # Guardamos como último válido y reseteamos la edad
+                self.last_valid_res = res
+                self.last_valid_age = 0
+            else:
+                # Si no hubo detección, envejecemos el último válido
+                self.last_valid_age += 1
+        else:
+            # No procesamos este frame; si no hay nuevo res, solo envejecemos si ya veníamos sosteniendo
+            if self.last_valid_res is not None:
+                self.last_valid_age += 1
+
+        # Elegimos qué resultados dibujar:
+        res_to_draw = None
+        if do_process:
+            # Si procesamos recién, usamos el res actual si tiene algo;
+            # si no, probamos el último válido si está dentro del hold.
+            if 'res' in locals():
+                any_now = (res.pose_landmarks is not None) or \
+                          (res.left_hand_landmarks is not None) or \
+                          (res.right_hand_landmarks is not None)
+                if any_now:
+                    res_to_draw = res
+                elif self.last_valid_res is not None and self.last_valid_age <= self.hold_max_frames:
+                    res_to_draw = self.last_valid_res
+        else:
+            # En frames no procesados, como mínimo intentamos dibujar el último válido dentro del hold
+            if self.last_valid_res is not None and self.last_valid_age <= self.hold_max_frames:
+                res_to_draw = self.last_valid_res
+
+        # Dibujo sobre el frame original (draw_on)
+        if res_to_draw is not None:
+            ds = self.mp_draw.DrawingSpec(thickness=2, circle_radius=2)
+            # Pose
+            if res_to_draw.pose_landmarks:
+                self.mp_draw.draw_landmarks(
+                    image=draw_on,
+                    landmark_list=res_to_draw.pose_landmarks,
+                    connections=self.mp_pose.POSE_CONNECTIONS,
+                    landmark_drawing_spec=ds,
+                    connection_drawing_spec=ds
+                )
+            # Mano izquierda
+            if res_to_draw.left_hand_landmarks:
+                self.mp_draw.draw_landmarks(
+                    image=draw_on,
+                    landmark_list=res_to_draw.left_hand_landmarks,
+                    connections=self.mp_hands.HAND_CONNECTIONS,
+                    landmark_drawing_spec=ds,
+                    connection_drawing_spec=ds
+                )
+            # Mano derecha
+            if res_to_draw.right_hand_landmarks:
+                self.mp_draw.draw_landmarks(
+                    image=draw_on,
+                    landmark_list=res_to_draw.right_hand_landmarks,
+                    connections=self.mp_hands.HAND_CONNECTIONS,
+                    landmark_drawing_spec=ds,
+                    connection_drawing_spec=ds
+                )
+        else:
+            # Si ya superamos el hold, reseteamos para no acumular edad infinita
+            if self.last_valid_age > self.hold_max_frames:
+                self.last_valid_res = None
+                self.last_valid_age = 0
+
+        # Mostrar en QLabel
+        frame_rgb = cv2.cvtColor(draw_on, cv2.COLOR_BGR2RGB)
+        h, w, ch = frame_rgb.shape
+        qimg = QImage(frame_rgb.data, w, h, ch * w, QImage.Format_RGB888)
+        self.label.setPixmap(QPixmap.fromImage(qimg))
 
     def closeEvent(self, event):
         """Cerrar cámara al cerrar la app"""
@@ -419,6 +585,13 @@ class CameraApp(QMainWindow):
                 self.cap.release()
         except Exception:
             pass
+
+        try:
+            if hasattr(self, "holistic") and self.holistic is not None:
+                self.holistic.close()
+        except Exception:
+            pass
+
         event.accept()
 
 
